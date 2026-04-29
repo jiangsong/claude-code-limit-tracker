@@ -37,12 +37,16 @@ def setup_virtual_env():
     
     project_dir = Path(__file__).parent
     
-    # Create virtual environment using uv
-    print("Creating virtual environment...")
-    result = subprocess.run(['uv', 'venv'], cwd=project_dir, capture_output=True)
-    if result.returncode != 0:
-        print(f"❌ Failed to create virtual environment: {result.stderr.decode()}")
-        return False
+    # Create virtual environment using uv (reuse if already exists)
+    venv_dir = project_dir / ".venv"
+    if venv_dir.exists():
+        print(f"Reusing existing virtual environment at {venv_dir}")
+    else:
+        print("Creating virtual environment...")
+        result = subprocess.run(['uv', 'venv'], cwd=project_dir, capture_output=True)
+        if result.returncode != 0:
+            print(f"❌ Failed to create virtual environment: {result.stderr.decode()}")
+            return False
     
     # Install numpy using uv
     print("Installing numpy...")

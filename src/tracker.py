@@ -24,6 +24,11 @@ class SessionData:
     sonnet_responses: int
     opus_responses: int
     project: str
+    prompt_timestamps: List[float] = None
+
+    def __post_init__(self):
+        if self.prompt_timestamps is None:
+            self.prompt_timestamps = []
 
 @dataclass
 class UsageData:
@@ -50,9 +55,9 @@ class UsageTracker:
         # Ensure data directory exists
         self.data_path.mkdir(exist_ok=True)
         
-        # Time constants
+        # Time constants (cycle start is computed per-update from rolling window)
         self.week_start = self._get_week_start()
-        self.cycle_5h_start = self._get_5h_cycle_start()
+        self.cycle_5h_start = 0.0
         
         # Cache for parsed data
         self._cache = {}
@@ -67,12 +72,34 @@ class UsageTracker:
         monday_midnight = monday.replace(hour=0, minute=0, second=0, microsecond=0)
         return monday_midnight.timestamp()
     
-    def _get_5h_cycle_start(self) -> float:
-        """Get current 5-hour cycle start in seconds."""
+    def _compute_rolling_5h_window(self, prompt_timestamps: List[float]) -> Tuple[float, int]:
+        """Find the current rolling 5-hour window.
+
+        Matches Anthropic's behavior: a window opens at the first prompt and lasts 5
+        hours; any prompt arriving after the window closes opens a fresh one. Returns
+        ``(window_start, prompts_in_window)``. If no window is currently active (the
+        most recent prompt is older than 5 hours), returns ``(now, 0)`` so the next
+        prompt will be treated as the start of a new window.
+        """
+        window_size = 5 * 3600
         now = time.time()
-        hours_since_epoch = now / 3600
-        cycle_number = int(hours_since_epoch / 5)
-        return cycle_number * 5 * 3600
+
+        if not prompt_timestamps:
+            return (now, 0)
+
+        sorted_ts = sorted(prompt_timestamps)
+        window_start = sorted_ts[0]
+        count = 0
+        for ts in sorted_ts:
+            if ts >= window_start + window_size:
+                window_start = ts
+                count = 1
+            else:
+                count += 1
+
+        if window_start + window_size <= now:
+            return (now, 0)
+        return (window_start, count)
     
     def _parse_timestamp(self, ts: str) -> Optional[float]:
         """Parse ISO timestamp to epoch seconds efficiently."""
@@ -107,32 +134,37 @@ class UsageTracker:
             return self._cache[cache_key]
         
         timestamps = []
+        prompt_timestamps = []
         prompts = 0
         sonnet_responses = 0
         opus_responses = 0
-        
+
         try:
             with open(jsonl_path, 'r') as f:
                 for line in f:
                     try:
                         msg = json.loads(line)
-                        
+
                         # Collect timestamp
+                        ts_epoch = None
                         if ts := msg.get('timestamp'):
-                            if epoch := self._parse_timestamp(ts):
-                                timestamps.append(epoch)
-                        
+                            ts_epoch = self._parse_timestamp(ts)
+                            if ts_epoch:
+                                timestamps.append(ts_epoch)
+
                         # Count user prompts (excluding commands and meta messages)
-                        if (msg.get('type') == 'user' and 
+                        if (msg.get('type') == 'user' and
                             msg.get('message', {}).get('role') == 'user' and
                             not msg.get('isMeta', False) and
                             msg.get('userType') == 'external'):  # Only external user messages
-                            
+
                             content = msg.get('message', {}).get('content', '')
                             # Skip empty content and command messages
                             if content and not self._is_command_message(content):
                                 prompts += 1
-                        
+                                if ts_epoch:
+                                    prompt_timestamps.append(ts_epoch)
+
                         # Count model responses
                         elif msg.get('type') == 'assistant':
                             model = msg.get('message', {}).get('model', '').lower()
@@ -164,7 +196,8 @@ class UsageTracker:
             prompt_count=prompts,
             sonnet_responses=sonnet_responses,
             opus_responses=opus_responses,
-            project=jsonl_path.parent.name
+            project=jsonl_path.parent.name,
+            prompt_timestamps=prompt_timestamps,
         )
         
         # Update cache
@@ -185,22 +218,28 @@ class UsageTracker:
             if project_dir.is_dir():
                 for jsonl_file in project_dir.glob('*.jsonl'):
                     session = self._analyze_jsonl_file(jsonl_file)
-                    if session.duration_hours > 0:  # Only include real sessions
+                    # Keep any session with prompts or measurable duration; the
+                    # rolling 5h window relies on every prompt timestamp, even
+                    # from short single-message sessions.
+                    if session.prompt_count > 0 or session.duration_hours > 0:
                         sessions.append(session)
-        
+
         return sessions
     
     def calculate_usage(self) -> UsageData:
         """Calculate complete usage statistics."""
         sessions = self.get_all_sessions()
-        
-        # Filter sessions by time
+
+        # Filter weekly sessions by start time (Monday 00:00 local)
         week_sessions = [s for s in sessions if s.start_time >= self.week_start]
-        cycle_sessions = [s for s in sessions if s.start_time >= self.cycle_5h_start]
-        
-        # Calculate 5-hour cycle stats
-        cycle_prompts = sum(s.prompt_count for s in cycle_sessions)
-        
+
+        # Compute the rolling 5h window from every prompt timestamp seen so far.
+        all_prompt_ts = []
+        for s in sessions:
+            all_prompt_ts.extend(s.prompt_timestamps)
+        cycle_start, cycle_prompts = self._compute_rolling_5h_window(all_prompt_ts)
+        self.cycle_5h_start = cycle_start
+
         # Calculate weekly stats using numpy for efficiency
         weekly_prompts = sum(s.prompt_count for s in week_sessions)
         
@@ -218,7 +257,7 @@ class UsageTracker:
         
         return UsageData(
             current_5h_prompts=cycle_prompts,
-            current_5h_start=self.cycle_5h_start,
+            current_5h_start=cycle_start,
             weekly_sonnet_hours=round(sonnet_hours, 2),
             weekly_opus_hours=round(opus_hours, 2),
             weekly_prompts=weekly_prompts,
