@@ -18,6 +18,18 @@ import sys
 import time
 from pathlib import Path
 
+# Claude Code pipes our stdout through a shell; on Windows that defaults to
+# the console's OEM codepage (e.g. cp936) which mangles emoji + ANSI. Force
+# UTF-8 on stdin/stdout/stderr so the status line renders correctly.
+if sys.platform == "win32":
+    for stream_name in ("stdout", "stderr", "stdin"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
 from tracker import UsageTracker
 from config import Config
 from git_info import GitInfo
@@ -143,7 +155,7 @@ def generate_status_line():
         try:
             settings_path = Path.home() / ".claude" / "settings.json"
             if settings_path.exists():
-                with open(settings_path) as f:
+                with open(settings_path, encoding="utf-8") as f:
                     s = json.load(f)
                 model_setting = s.get("model", "").lower()
                 if "opus" in model_setting:

@@ -117,13 +117,15 @@ class GitInfo:
                 cwd=directory,
                 capture_output=True,
                 text=True,
-                timeout=timeout
+                encoding='utf-8',
+                errors='replace',
+                timeout=timeout,
             )
-            
+
             if result.returncode == 0:
                 return result.stdout.strip()
-            
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
+
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, OSError):
             pass
         
         return None

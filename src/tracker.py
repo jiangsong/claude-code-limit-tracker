@@ -140,7 +140,7 @@ class UsageTracker:
         opus_responses = 0
 
         try:
-            with open(jsonl_path, 'r') as f:
+            with open(jsonl_path, 'r', encoding='utf-8', errors='replace') as f:
                 for line in f:
                     try:
                         msg = json.loads(line)
@@ -283,7 +283,7 @@ class UsageTracker:
             "last_updated": int(usage_data.last_updated * 1000)
         }
         
-        with open(self.data_path / "usage_data.json", 'w') as f:
+        with open(self.data_path / "usage_data.json", 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
     
     def update(self) -> UsageData:

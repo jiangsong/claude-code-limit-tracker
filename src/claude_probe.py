@@ -3,13 +3,17 @@ Probes `claude /usage` via PTY to read real Anthropic server-side quota data.
 Returns the same percentages and reset times that the user sees in /status.
 """
 import os
-import pty
 import re
-import select
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
+
+# `pty` / `select` (on master fds) are POSIX-only. Defer the import so this
+# module can still be loaded on Windows for cache reading; the actual probe
+# will fall back to an error ProbeResult there.
+_PTY_AVAILABLE = sys.platform != "win32"
 
 
 @dataclass
@@ -26,6 +30,12 @@ class ProbeResult:
 
 def _run_usage_pty(timeout: float = 20.0) -> bytes:
     """Run `claude /usage` under a PTY and return the raw terminal bytes."""
+    if not _PTY_AVAILABLE:
+        raise RuntimeError("pty probe is not supported on this platform")
+
+    import pty
+    import select
+
     env = os.environ.copy()
     env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
 
@@ -204,7 +214,7 @@ def read_cache() -> Optional["ProbeResult"]:
     if not CACHE_FILE:
         return None
     try:
-        with open(CACHE_FILE) as f:
+        with open(CACHE_FILE, encoding="utf-8") as f:
             d = json.load(f)
         return ProbeResult(
             session_pct_used=d.get("session_pct_used"),
@@ -238,7 +248,7 @@ def write_cache(result: "ProbeResult") -> None:
     }
     tmp = CACHE_FILE + ".tmp"
     try:
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f)
         os.replace(tmp, CACHE_FILE)
     except Exception:
@@ -247,18 +257,30 @@ def write_cache(result: "ProbeResult") -> None:
 
 def spawn_background_refresh(cache_path: str, src_dir: str) -> None:
     """Launch a background process to refresh the probe cache."""
-    import sys
+    if not _PTY_AVAILABLE:
+        return  # PTY probe not supported on this platform
     script = os.path.join(src_dir, "claude_probe.py")
-    subprocess.Popen(
-        [sys.executable, script, "--update-cache", cache_path],
+    popen_kwargs = dict(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         close_fds=True,
     )
+    if sys.platform == "win32":
+        # Detach from the parent's console so no window flashes during the
+        # status-line refresh, and so the parent can exit independently.
+        popen_kwargs["creationflags"] = (
+            subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    subprocess.Popen(
+        [sys.executable, script, "--update-cache", cache_path],
+        **popen_kwargs,
+    )
 
 
 if __name__ == "__main__":
-    import sys, json as _json
+    import json as _json
     if len(sys.argv) >= 3 and sys.argv[1] == "--update-cache":
         cache_path = sys.argv[2]
         set_cache_path(cache_path)

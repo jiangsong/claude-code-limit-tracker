@@ -83,20 +83,20 @@ class Config:
         """Load user's subscription tier."""
         if self.user_config_path.exists():
             try:
-                with open(self.user_config_path, 'r') as f:
+                with open(self.user_config_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     return data.get('subscription_tier', 'pro')
             except:
                 pass
-        
+
         # Default to pro
         return 'pro'
-    
+
     def _load_git_settings(self) -> None:
         """Load git configuration settings."""
         if self.user_config_path.exists():
             try:
-                with open(self.user_config_path, 'r') as f:
+                with open(self.user_config_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     git_config = data.get('git_settings', {})
                     
@@ -125,7 +125,7 @@ class Config:
                     "max": limits.weekly_opus_max
                 }
         
-        with open(self.limits_path, 'w') as f:
+        with open(self.limits_path, 'w', encoding='utf-8') as f:
             json.dump(limits_data, f, indent=2)
     
     def get_tier_limits(self) -> TierLimits:
@@ -149,7 +149,7 @@ class Config:
             }
         }
         
-        with open(self.user_config_path, 'w') as f:
+        with open(self.user_config_path, 'w', encoding='utf-8') as f:
             json.dump(config_data, f, indent=2)
     
     def get_usage_color(self, current: float, max_limit: float) -> tuple:

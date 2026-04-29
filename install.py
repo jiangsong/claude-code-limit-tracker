@@ -10,185 +10,252 @@ import sys
 import subprocess
 import shutil
 from pathlib import Path
-from datetime import datetime
+
+# Console codepage on Chinese-locale Windows is cp936; emoji + ✓/❌ glyphs
+# will crash on print without an explicit UTF-8 reconfiguration.
+if sys.platform == "win32":
+    for _stream_name in ("stdout", "stderr"):
+        _stream = getattr(sys, _stream_name, None)
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def _venv_python(project_dir: Path) -> Path:
+    """Return the path to the venv's Python interpreter for this OS."""
+    if sys.platform == "win32":
+        return project_dir / ".venv" / "Scripts" / "python.exe"
+    return project_dir / ".venv" / "bin" / "python"
+
+
+def _have_uv() -> bool:
+    return shutil.which("uv") is not None
+
 
 def check_dependencies():
-    """Check and install required dependencies."""
+    """Check required dependencies. uv is optional."""
     print("Checking dependencies...")
-    
-    # Check for uv
-    if shutil.which('uv') is None:
-        print("\n❌ 'uv' is not installed.")
-        print("Please install uv first: https://github.com/astral-sh/uv")
-        print("Quick install: curl -LsSf https://astral.sh/uv/install.sh | sh")
-        return False
-    
-    # Check for Python
+
     if sys.version_info < (3, 8):
         print("\n❌ Python 3.8+ is required.")
         return False
-    
-    print("✓ All system dependencies found")
+
+    if _have_uv():
+        print("✓ uv detected")
+    else:
+        print("ℹ uv not found — falling back to stdlib venv + pip "
+              "(install uv for faster setup: https://github.com/astral-sh/uv)")
+
+    print("✓ Python version OK")
     return True
 
+
 def setup_virtual_env():
-    """Set up virtual environment and install packages."""
+    """Set up virtual environment and install packages.
+
+    Prefers uv when available; otherwise uses `python -m venv` + pip.
+    """
     print("\nSetting up Python environment...")
-    
+
     project_dir = Path(__file__).parent
-    
-    # Create virtual environment using uv (reuse if already exists)
     venv_dir = project_dir / ".venv"
-    if venv_dir.exists():
+    py = _venv_python(project_dir)
+
+    if venv_dir.exists() and py.exists():
         print(f"Reusing existing virtual environment at {venv_dir}")
     else:
         print("Creating virtual environment...")
-        result = subprocess.run(['uv', 'venv'], cwd=project_dir, capture_output=True)
+        if _have_uv():
+            cmd = ["uv", "venv"]
+        else:
+            cmd = [sys.executable, "-m", "venv", str(venv_dir)]
+        result = subprocess.run(cmd, cwd=project_dir, capture_output=True)
         if result.returncode != 0:
-            print(f"❌ Failed to create virtual environment: {result.stderr.decode()}")
+            err = result.stderr.decode(errors="replace") if result.stderr else ""
+            print(f"❌ Failed to create virtual environment: {err}")
             return False
-    
-    # Install numpy using uv
+
+    # If numpy already imports cleanly, skip the install step entirely. This
+    # matters because `uv venv` creates a pip-less venv, so the stdlib pip
+    # fallback fails on existing uv-created venvs.
+    probe = subprocess.run(
+        [str(py), "-c", "import numpy"], capture_output=True
+    )
+    if probe.returncode == 0:
+        print("✓ numpy already installed")
+        print("✓ Python environment configured")
+        return True
+
     print("Installing numpy...")
-    result = subprocess.run(['uv', 'pip', 'install', 'numpy'], cwd=project_dir, capture_output=True)
+    if _have_uv():
+        cmd = ["uv", "pip", "install", "numpy"]
+        cwd = project_dir
+    else:
+        # Bootstrap pip if the venv was created without it (e.g. `uv venv`).
+        has_pip = subprocess.run(
+            [str(py), "-c", "import pip"], capture_output=True
+        ).returncode == 0
+        if not has_pip:
+            print("Bootstrapping pip via ensurepip...")
+            ensure = subprocess.run(
+                [str(py), "-m", "ensurepip", "--upgrade"], capture_output=True
+            )
+            if ensure.returncode != 0:
+                err = ensure.stderr.decode(errors="replace") if ensure.stderr else ""
+                print(f"❌ ensurepip failed: {err}")
+                print("  Install uv (https://github.com/astral-sh/uv) or recreate "
+                      ".venv with `python -m venv .venv` and retry.")
+                return False
+        cmd = [str(py), "-m", "pip", "install", "--disable-pip-version-check", "numpy"]
+        cwd = None
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True)
     if result.returncode != 0:
-        print(f"❌ Failed to install numpy: {result.stderr.decode()}")
+        err = result.stderr.decode(errors="replace") if result.stderr else ""
+        print(f"❌ Failed to install numpy: {err}")
         return False
-    
+
     print("✓ Python environment configured")
     return True
+
 
 def integrate_with_claude():
     """Integrate tracker with Claude Code settings."""
     print("\nIntegrating with Claude Code...")
-    
+
     claude_settings = Path.home() / ".claude" / "settings.json"
     project_dir = Path(__file__).parent.resolve()
-    
-    # Create backup
+
     if claude_settings.exists():
         backup_path = claude_settings.with_suffix('.json.backup')
         print(f"Creating backup: {backup_path}")
         shutil.copy2(claude_settings, backup_path)
-        
-        with open(claude_settings, 'r') as f:
+
+        with open(claude_settings, 'r', encoding='utf-8') as f:
             settings = json.load(f)
     else:
         settings = {}
-    
-    # Update status line settings - use uv run to ensure proper environment
+
+    # Run the status line via the venv's Python directly. This is
+    # self-contained (no uv dependency at status-line execution time) and
+    # avoids any shell-specific `cd` / chaining issues across cmd.exe,
+    # PowerShell, and POSIX shells.
+    py = _venv_python(project_dir)
+    status_script = project_dir / "status_line.py"
     settings['statusLine'] = {
         'type': 'command',
-        'command': f'cd {project_dir} && uv run python status_line.py'
+        'command': f'"{py}" "{status_script}"',
     }
-    
-    # Save updated settings
+
     claude_settings.parent.mkdir(exist_ok=True)
-    with open(claude_settings, 'w') as f:
+    with open(claude_settings, 'w', encoding='utf-8') as f:
         json.dump(settings, f, indent=2)
-    
+
     print("✓ Claude Code settings updated")
     return True
 
+
+def _is_already_configured(project_dir: Path) -> bool:
+    cfg = project_dir / "config" / "user_config.json"
+    if not cfg.exists():
+        return False
+    try:
+        with open(cfg, encoding="utf-8") as f:
+            return bool(json.load(f).get("configured"))
+    except Exception:
+        return False
+
+
 def configure_subscription():
-    """Configure subscription tier."""
+    """Configure subscription tier (interactive)."""
     print("\nConfiguring subscription tier...")
-    
+
     project_dir = Path(__file__).parent
-    config_dir = project_dir / "config"
-    config_dir.mkdir(exist_ok=True)
-    
-    # Run interactive configuration
-    if sys.platform == "win32":
-        python_cmd = project_dir / ".venv" / "Scripts" / "python.exe"
-    else:
-        python_cmd = project_dir / ".venv" / "bin" / "python"
-    
-    config_script = f"""
-import sys
-sys.path.insert(0, '{project_dir / 'src'}')
-from config import Config
-config = Config()
-config.interactive_setup()
-"""
-    
-    result = subprocess.run([str(python_cmd), '-c', config_script])
-    
+    (project_dir / "config").mkdir(exist_ok=True)
+
+    if _is_already_configured(project_dir):
+        try:
+            with open(project_dir / "config" / "user_config.json", encoding="utf-8") as f:
+                tier = json.load(f).get("subscription_tier", "?")
+        except Exception:
+            tier = "?"
+        print(f"✓ Already configured (tier: {tier}). Run `python configure.py` to change.")
+        return True
+
+    py = _venv_python(project_dir)
+    config_script = (
+        "import sys\n"
+        f"sys.path.insert(0, r'{project_dir / 'src'}')\n"
+        "from config import Config\n"
+        "Config().interactive_setup()\n"
+    )
+    result = subprocess.run([str(py), "-c", config_script])
+
     if result.returncode == 0:
         print("✓ Subscription tier configured")
         return True
-    else:
-        print("❌ Configuration failed")
-        return False
+    print("❌ Configuration failed")
+    return False
+
 
 def test_installation():
-    """Test the installation."""
+    """Smoke-test the installed status line."""
     print("\nTesting installation...")
-    
+
     project_dir = Path(__file__).parent
-    
-    # Determine Python executable
-    if sys.platform == "win32":
-        python_cmd = project_dir / ".venv" / "Scripts" / "python.exe"
-    else:
-        python_cmd = project_dir / ".venv" / "bin" / "python"
-    
-    # Test status line generation
+    py = _venv_python(project_dir)
+
     test_input = json.dumps({"projectPath": str(project_dir)})
-    
     result = subprocess.run(
-        [str(python_cmd), str(project_dir / 'status_line.py')],
+        [str(py), str(project_dir / 'status_line.py')],
         input=test_input,
         capture_output=True,
-        text=True
+        text=True,
+        encoding='utf-8',
+        errors='replace',
     )
-    
+
     if result.returncode == 0 and result.stdout:
         print("✓ Status line test successful")
         print(f"Sample output: {result.stdout.strip()}")
         return True
-    else:
-        print("❌ Status line test failed")
-        if result.stderr:
-            print(f"Error: {result.stderr}")
-        return False
+
+    print("❌ Status line test failed")
+    if result.stderr:
+        print(f"Error: {result.stderr}")
+    return False
+
 
 def main():
-    """Main installation process."""
     print("=" * 60)
     print("Claude Code Usage Tracker - Python Installation")
     print("=" * 60)
-    
-    # Check if running with --test flag
+
     test_mode = '--test' in sys.argv
-    
+    skip_configure = '--skip-configure' in sys.argv
+
     if test_mode:
         print("\n🔍 Running in TEST MODE - no changes will be made")
-    
-    # Step 1: Check dependencies
+
     if not check_dependencies():
         sys.exit(1)
-    
-    # Step 2: Setup virtual environment
+
     if not test_mode:
         if not setup_virtual_env():
             sys.exit(1)
-    
-    # Step 3: Configure subscription
-    if not test_mode:
-        if not configure_subscription():
+
+        if skip_configure:
+            print("\nℹ Skipping subscription configuration (--skip-configure).")
+        elif not configure_subscription():
             print("\n⚠️  Subscription configuration skipped")
-    
-    # Step 4: Integrate with Claude
-    if not test_mode:
+
         if not integrate_with_claude():
             sys.exit(1)
-    
-    # Step 5: Test installation
-    if not test_mode:
+
         if not test_installation():
             print("\n⚠️  Test failed but installation may still work")
-    
+
     print("\n" + "=" * 60)
     print("✅ Installation complete!")
     print("\nThe tracker is now integrated with Claude Code.")
@@ -196,6 +263,7 @@ def main():
     print("\nTo reconfigure your subscription tier, run:")
     print("  python configure.py")
     print("=" * 60)
+
 
 if __name__ == "__main__":
     main()
