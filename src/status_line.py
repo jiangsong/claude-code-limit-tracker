@@ -17,6 +17,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 # Claude Code pipes our stdout through a shell; on Windows that defaults to
 # the console's OEM codepage (e.g. cp936) which mangles emoji + ANSI. Force
@@ -58,7 +59,7 @@ def _pct_color(config: "Config", pct_used: int):
         return (255, 80, 80)    # red
 
 
-def _format_reset(reset_text: str | None, time_remaining_sec: float) -> str:
+def _format_reset(reset_text: Optional[str], time_remaining_sec: float) -> str:
     """Return a formatted reset string, preferring the probe's reset time."""
     if reset_text:
         # Extract just the time part, e.g. "11:50am" from "Resets 11:50am (Asia/Shanghai)"
@@ -80,33 +81,72 @@ def _format_reset(reset_text: str | None, time_remaining_sec: float) -> str:
     return f"{h}h{m:02d}m" if h else f"{m}m"
 
 
-def _read_stdin_rate_limits():
-    """Read and parse rate_limits from Claude Code's stdin JSON.
+def _format_countdown(secs: float) -> str:
+    """Compact countdown for the weekly reset.
 
-    Returns (five_hour, seven_day) dicts or (None, None) if unavailable.
+    >= 1 day -> '1d20h' (no minutes — keeps the status line short)
+    <  1 day -> '4h28m' or '15m'
+    <= 0     -> 'now'
+    """
+    if secs <= 0:
+        return "now"
+    if secs >= 86400:
+        d = int(secs // 86400)
+        h = int((secs % 86400) // 3600)
+        return f"{d}d{h}h"
+    h = int(secs // 3600)
+    m = int((secs % 3600) // 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+def _read_stdin_payload() -> dict:
+    """Read and parse Claude Code's full stdin JSON payload.
+
+    Claude Code pipes a single JSON object to the statusLine command on
+    every refresh. Returns the parsed dict (rate_limits, workspace, cwd,
+    model, ...) or {} if unavailable. stdin can only be read once, so
+    callers must extract every field they need from the returned dict.
     """
     try:
         if not sys.stdin.isatty():
             raw = sys.stdin.read()
             if raw.strip():
-                data = json.loads(raw)
-                rl = data.get("rate_limits", {})
-                return rl.get("five_hour"), rl.get("seven_day")
+                return json.loads(raw)
     except Exception:
         pass
-    return None, None
+    return {}
+
+
+def _resolve_project_path(payload: dict) -> str:
+    """Pick the session's current directory from the stdin payload.
+
+    Claude Code's main process keeps its original cwd even when the user
+    cd's inside a session, so os.getcwd() is unreliable. The session's
+    actual directory is delivered via stdin under workspace.current_dir
+    (with cwd / projectPath as compatibility fallbacks).
+    """
+    workspace = payload.get("workspace") or {}
+    return (
+        workspace.get("current_dir")
+        or payload.get("cwd")
+        or payload.get("projectPath")
+        or os.getcwd()
+    )
 
 
 def generate_status_line():
     """Generate status line output for Claude Code."""
 
-    # --- Native rate_limits from Claude Code stdin ---
-    stdin_5h, stdin_7d = _read_stdin_rate_limits()
+    # --- Read Claude Code's stdin payload once (rate_limits + workspace) ---
+    payload = _read_stdin_payload()
+    rate_limits = payload.get("rate_limits") or {}
+    stdin_5h = rate_limits.get("five_hour")
+    stdin_7d = rate_limits.get("seven_day")
 
     # --- Project / git ---
+    project_path = _resolve_project_path(payload)
     try:
-        project_path = os.getcwd()
-        project_name = Path(project_path).name
+        project_name = Path(project_path).name or "unknown"
         if project_name == "claude-code-usage-tracking":
             project_name = "usage-tracker"
     except Exception:
@@ -242,12 +282,12 @@ def generate_status_line():
                 f"O:{cached.opus_pct_used}%"
                 f"\033[0m"
             )
-        # Reset: prefer stdin resets_at, then probe reset text
+        # Weekly reset: only show a compact countdown when stdin gives a numeric
+        # resets_at. The probe-cache text fallback ("Resets May 1 at 7pm …") is
+        # intentionally dropped to keep the status line short.
         w_resets_at = stdin_7d.get("resets_at") if stdin_7d else None
         if w_resets_at:
-            weekly_str += f" ↻{_format_reset(None, w_resets_at - now)}"
-        elif cached and cached.weekly_reset_text:
-            weekly_str += f" ↻{_format_reset(cached.weekly_reset_text, 0)}"
+            weekly_str += f" ↻{_format_countdown(w_resets_at - now)}"
         parts.append(weekly_str)
     else:
         # Fallback: local session-hour estimate (labelled as approximate)
