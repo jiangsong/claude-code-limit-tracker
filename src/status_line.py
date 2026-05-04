@@ -117,6 +117,61 @@ def _read_stdin_payload() -> dict:
     return {}
 
 
+def _resolve_current_model(payload: dict, usage) -> str:
+    """Pick the active model name to display.
+
+    Priority:
+      1. Claude Code stdin payload `model.display_name` / `model.id` — refreshed
+         on every status-line render and reflects the user's /model selection,
+         including "Default" (which `~/.claude/settings.json` does NOT record).
+      2. CLAUDE_MODEL env var (legacy / non-CC contexts).
+      3. `~/.claude/settings.json` `model` field (only set on explicit override).
+      4. Most-recent session's response counts as a last resort.
+    """
+    model_payload = payload.get("model") or {}
+    display_name = (model_payload.get("display_name") or "").strip()
+    model_id = (model_payload.get("id") or "").strip().lower()
+
+    if display_name:
+        # Strip parenthetical qualifiers like "(1M context)" — they bloat the
+        # status line and push the weekly reset countdown off-screen.
+        import re
+        return re.sub(r"\s*\([^)]*\)\s*", "", display_name).strip() or display_name
+    if model_id:
+        if "opus" in model_id:
+            return "Opus"
+        if "sonnet" in model_id:
+            return "Sonnet"
+        if "haiku" in model_id:
+            return "Haiku"
+
+    claude_model = os.environ.get("CLAUDE_MODEL", "").lower()
+    if "opus" in claude_model:
+        return "Opus 4"
+    if "sonnet" in claude_model:
+        return "Sonnet 4"
+
+    try:
+        settings_path = Path.home() / ".claude" / "settings.json"
+        if settings_path.exists():
+            with open(settings_path, encoding="utf-8") as f:
+                s = json.load(f)
+            model_setting = (s.get("model") or "").lower()
+            if "opus" in model_setting:
+                return "Opus 4"
+            if "sonnet" in model_setting:
+                return "Sonnet 4"
+    except Exception:
+        pass
+
+    if usage and usage.sessions:
+        recent = usage.sessions[-1]
+        if recent.opus_responses > recent.sonnet_responses:
+            return "Opus 4"
+
+    return "Sonnet 4"
+
+
 def _resolve_project_path(payload: dict) -> str:
     """Pick the session's current directory from the stdin payload.
 
@@ -184,29 +239,10 @@ def generate_status_line():
         if git_display:
             parts.append(git_display)
 
-    # Model
-    current_model = "Sonnet 4"
-    claude_model = os.environ.get("CLAUDE_MODEL", "").lower()
-    if "opus" in claude_model:
-        current_model = "Opus 4"
-    elif "sonnet" in claude_model:
-        current_model = "Sonnet 4"
-    else:
-        try:
-            settings_path = Path.home() / ".claude" / "settings.json"
-            if settings_path.exists():
-                with open(settings_path, encoding="utf-8") as f:
-                    s = json.load(f)
-                model_setting = s.get("model", "").lower()
-                if "opus" in model_setting:
-                    current_model = "Opus 4"
-                elif "sonnet" in model_setting:
-                    current_model = "Sonnet 4"
-        except Exception:
-            if usage.sessions:
-                recent = usage.sessions[-1]
-                if recent.opus_responses > recent.sonnet_responses:
-                    current_model = "Opus 4"
+    # Model — Claude Code sends the active model in stdin on every refresh;
+    # this reflects the user's /model selection (including "Default") accurately.
+    # Env var and settings.json are legacy fallbacks for non-CC contexts.
+    current_model = _resolve_current_model(payload, usage)
     parts.append(f"🤖 {current_model}")
 
     # --- 5-hour session usage ---
