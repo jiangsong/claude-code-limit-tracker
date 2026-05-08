@@ -8,8 +8,15 @@ Usage data priority:
   2. Real Anthropic data from `claude /usage` probe cache (refreshes every 10 min)
   3. Local JSONL token counts as fallback (approximate)
 
-The probe runs in the background every 10 minutes to keep data fresh even
-during idle periods. Sonnet/Opus split is only available from the probe.
+Cache freshness is maintained by two cooperating mechanisms:
+  - A SessionStart hook (configured in ~/.claude/settings.json by install.py)
+    runs the probe synchronously when a Claude Code session begins, so the
+    very first status-line render uses fresh data.
+  - A long-running background daemon (started lazily here via ensure_daemon)
+    refreshes the cache every PROBE_TTL seconds and keeps running even after
+    Claude Code exits, so cached values stay current between sessions.
+
+Sonnet/Opus split is only available from the probe.
 """
 
 import json
@@ -214,12 +221,21 @@ def generate_status_line():
     usage = tracker.update()
 
     # --- Probe cache (supplementary: sonnet/opus split, 10-min auto-refresh) ---
+    # The cache is kept fresh by a long-running background daemon that polls
+    # `claude /usage` every PROBE_TTL seconds even when no Claude session is
+    # active. ensure_daemon() is idempotent — it costs a stat + tiny read when
+    # the daemon is already running. This replaces the previous one-shot spawn
+    # which only ran when a status line was being rendered.
     cache_path = _probe_cache_path()
     probe_mod.set_cache_path(cache_path)
+    probe_mod.ensure_daemon(cache_path, _src_dir(), PROBE_TTL)
     cached, cached_at = probe_mod.read_cache()
 
     now = time.time()
-    if cached_at is None or now - cached_at > PROBE_TTL:
+    if cached_at is None or now - cached_at > PROBE_TTL * 2:
+        # Daemon is running but the cache is unusually stale (e.g. probe is
+        # currently failing). Fire a one-shot probe as a safety net so we still
+        # get refresh attempts at status-line cadence.
         probe_mod.spawn_background_refresh(cache_path, _src_dir())
 
     # --- Fallback reset time from rolling window ---

@@ -90,7 +90,7 @@ def setup_virtual_env():
 
     print("Installing numpy...")
     if _have_uv():
-        cmd = ["uv", "pip", "install", "numpy"]
+        cmd = ["uv", "pip", "install", "numpy", "--python", str(py)]
         cwd = project_dir
     else:
         # Bootstrap pip if the venv was created without it (e.g. `uv venv`).
@@ -118,6 +118,57 @@ def setup_virtual_env():
 
     print("✓ Python environment configured")
     return True
+
+
+SESSION_HOOK_TIMEOUT = "15"  # seconds; SessionStart blocks Claude startup
+
+
+def _data_dir(project_dir: Path) -> Path:
+    return project_dir / "data"
+
+
+def _probe_cache_path(project_dir: Path) -> Path:
+    return _data_dir(project_dir) / "probe_cache.json"
+
+
+def _probe_script(project_dir: Path) -> Path:
+    return project_dir / "src" / "claude_probe.py"
+
+
+def _install_session_start_hook(settings: dict, project_dir: Path) -> None:
+    """Register a SessionStart hook that synchronously refreshes the probe cache.
+
+    This guarantees that the very first status-line render after Claude Code
+    starts up shows real-time `/usage` data instead of whatever was cached
+    when the previous session ended.
+
+    The hook is idempotent across re-installs: any existing hook entry whose
+    command points at our claude_probe.py is replaced rather than duplicated.
+    """
+    py = _venv_python(project_dir)
+    cache_path = _probe_cache_path(project_dir)
+    probe = _probe_script(project_dir)
+    hook_command = f'"{py}" "{probe}" --update-cache "{cache_path}" {SESSION_HOOK_TIMEOUT}'
+
+    hooks = settings.setdefault("hooks", {})
+    session_hooks = hooks.setdefault("SessionStart", [])
+
+    probe_str = str(probe)
+    new_entries = []
+    for entry in session_hooks:
+        sub_hooks = (entry or {}).get("hooks") or []
+        # Drop any prior installation of *our* probe hook; keep all others.
+        keep = [h for h in sub_hooks if probe_str not in (h or {}).get("command", "")]
+        if keep:
+            new_entry = dict(entry)
+            new_entry["hooks"] = keep
+            new_entries.append(new_entry)
+
+    new_entries.append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": hook_command}],
+    })
+    hooks["SessionStart"] = new_entries
 
 
 def integrate_with_claude():
@@ -148,12 +199,46 @@ def integrate_with_claude():
         'command': f'"{py}" "{status_script}"',
     }
 
+    _install_session_start_hook(settings, project_dir)
+
     claude_settings.parent.mkdir(exist_ok=True)
     with open(claude_settings, 'w', encoding='utf-8') as f:
         json.dump(settings, f, indent=2)
 
-    print("✓ Claude Code settings updated")
+    print("✓ Claude Code settings updated (statusLine + SessionStart probe hook)")
     return True
+
+
+def start_probe_daemon():
+    """Spawn the background probe daemon if not already running.
+
+    The daemon polls `claude /usage` every 10 minutes, so cached quota data
+    stays current even when no Claude Code session is active. On macOS/Linux
+    only — PTY probe is not supported on Windows.
+    """
+    if sys.platform == "win32":
+        print("ℹ Skipping probe daemon (PTY probe not supported on Windows)")
+        return True
+
+    print("\nStarting background probe daemon...")
+    project_dir = Path(__file__).parent.resolve()
+    py = _venv_python(project_dir)
+    cache_path = _probe_cache_path(project_dir)
+    src_dir = project_dir / "src"
+
+    _data_dir(project_dir).mkdir(exist_ok=True)
+
+    result = subprocess.run(
+        [str(py), str(_probe_script(project_dir)),
+         "--ensure-daemon", str(cache_path), str(src_dir)],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        print("✓ Probe daemon ensured (refreshes /usage every 10 min)")
+        return True
+    err = result.stderr.decode(errors="replace") if result.stderr else ""
+    print(f"⚠️  Failed to start probe daemon: {err}")
+    return False
 
 
 def _is_already_configured(project_dir: Path) -> bool:
@@ -252,6 +337,8 @@ def main():
 
         if not integrate_with_claude():
             sys.exit(1)
+
+        start_probe_daemon()
 
         if not test_installation():
             print("\n⚠️  Test failed but installation may still work")

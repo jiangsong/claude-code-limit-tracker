@@ -1,6 +1,17 @@
 """
 Probes `claude /usage` via PTY to read real Anthropic server-side quota data.
 Returns the same percentages and reset times that the user sees in /status.
+
+Run modes (CLI):
+  --update-cache <cache_path> [timeout]
+      One-shot probe; writes result to <cache_path>. Used by SessionStart hook.
+  --daemon <cache_path> [interval]
+      Long-running loop that refreshes <cache_path> every <interval> seconds.
+      Defaults to 600s. Holds a PID file at <cache_path>'s parent dir.
+  --ensure-daemon <cache_path> <src_dir> [interval]
+      Idempotent: spawns the daemon if it isn't already running.
+  --stop-daemon <cache_path>
+      Sends SIGTERM to a running daemon (no-op if absent).
 """
 import os
 import re
@@ -8,12 +19,15 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 # `pty` / `select` (on master fds) are POSIX-only. Defer the import so this
 # module can still be loaded on Windows for cache reading; the actual probe
 # will fall back to an error ProbeResult there.
 _PTY_AVAILABLE = sys.platform != "win32"
+
+DEFAULT_DAEMON_INTERVAL = 600.0  # seconds — matches PROBE_TTL in status_line.py
+PID_FILE_NAME = "probe_daemon.pid"
 
 
 @dataclass
@@ -165,10 +179,10 @@ def _extract_tier(text: str) -> Optional[str]:
     return None
 
 
-def probe() -> ProbeResult:
+def probe(timeout: float = 20.0) -> ProbeResult:
     """Run `claude /usage` and return parsed quota data."""
     try:
-        raw = _run_usage_pty()
+        raw = _run_usage_pty(timeout=timeout)
     except Exception as e:
         return ProbeResult(None, None, None, None, None, None, None, error=str(e))
 
@@ -256,7 +270,11 @@ def write_cache(result: "ProbeResult") -> None:
 
 
 def spawn_background_refresh(cache_path: str, src_dir: str) -> None:
-    """Launch a background process to refresh the probe cache."""
+    """Launch a background process to refresh the probe cache (one-shot).
+
+    Kept for backwards compatibility; new code should prefer `ensure_daemon`
+    which keeps the cache fresh even when Claude Code is idle.
+    """
     if not _PTY_AVAILABLE:
         return  # PTY probe not supported on this platform
     script = os.path.join(src_dir, "claude_probe.py")
@@ -279,13 +297,178 @@ def spawn_background_refresh(cache_path: str, src_dir: str) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Background daemon: keeps the probe cache fresh even when Claude Code is idle
+# ---------------------------------------------------------------------------
+
+def _pid_file_path(cache_path: str) -> str:
+    """PID file lives next to the cache so install/uninstall are co-located."""
+    return os.path.join(os.path.dirname(cache_path), PID_FILE_NAME)
+
+
+def _pid_alive(pid: int) -> bool:
+    """POSIX-style liveness probe via signal 0. Tolerates PermissionError
+    (process exists, owned by another user)."""
+    if pid <= 0 or pid == os.getpid():
+        return pid == os.getpid()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_pid_file(pid_file: str) -> int:
+    try:
+        with open(pid_file, encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return -1
+
+
+def daemon_loop(cache_path: str, interval: float = DEFAULT_DAEMON_INTERVAL) -> None:
+    """Refresh the cache every `interval` seconds until SIGTERM/SIGINT.
+
+    Uses an O_EXCL claim on the PID file so two daemons can't coexist; if a
+    stale (dead-PID) file is found the new daemon takes over. Cleans up the
+    PID file on exit, but only when it still owns it.
+    """
+    set_cache_path(cache_path)
+    pid_file = _pid_file_path(cache_path)
+    my_pid = os.getpid()
+
+    # Atomic claim. If another live daemon already holds the file, exit.
+    try:
+        fd = os.open(pid_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.write(fd, str(my_pid).encode())
+        os.close(fd)
+    except FileExistsError:
+        existing = _read_pid_file(pid_file)
+        if _pid_alive(existing) and existing != my_pid:
+            return
+        # Stale → take over
+        try:
+            with open(pid_file, "w", encoding="utf-8") as f:
+                f.write(str(my_pid))
+        except OSError:
+            return
+
+    import signal
+    stop_flag = {"v": False}
+
+    def _on_signal(signum, frame):  # noqa: ARG001
+        stop_flag["v"] = True
+
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if sig is not None:
+            try:
+                signal.signal(sig, _on_signal)
+            except (ValueError, OSError):
+                pass  # not main thread / unsupported
+
+    try:
+        while not stop_flag["v"]:
+            try:
+                write_cache(probe())
+            except Exception:
+                # Never crash the daemon on a single failed probe.
+                pass
+            # Sleep in short slices so SIGTERM is responsive.
+            slept = 0.0
+            slice_s = 2.0
+            while slept < interval and not stop_flag["v"]:
+                time.sleep(min(slice_s, interval - slept))
+                slept += slice_s
+    finally:
+        # Only remove the PID file if we still own it (avoid clobbering a
+        # successor daemon that took over after a SIGKILL).
+        if _read_pid_file(pid_file) == my_pid:
+            try:
+                os.remove(pid_file)
+            except OSError:
+                pass
+
+
+def ensure_daemon(
+    cache_path: str,
+    src_dir: str,
+    interval: float = DEFAULT_DAEMON_INTERVAL,
+) -> bool:
+    """Spawn the probe daemon if not already running.
+
+    Returns True if a new daemon was spawned, False otherwise. Idempotent and
+    fast: a stat + small read when the daemon is healthy.
+    """
+    if not _PTY_AVAILABLE:
+        return False  # PTY probe not supported on Windows
+
+    pid_file = _pid_file_path(cache_path)
+    if os.path.exists(pid_file):
+        existing = _read_pid_file(pid_file)
+        if _pid_alive(existing):
+            return False
+        # Stale — clean up so the new daemon can claim it cleanly.
+        try:
+            os.remove(pid_file)
+        except OSError:
+            pass
+
+    script = os.path.join(src_dir, "claude_probe.py")
+    subprocess.Popen(
+        [sys.executable, script, "--daemon", cache_path, str(interval)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=True,
+    )
+    return True
+
+
+def stop_daemon(cache_path: str) -> bool:
+    """Send SIGTERM to a running daemon. Returns True if a signal was sent."""
+    pid_file = _pid_file_path(cache_path)
+    if not os.path.exists(pid_file):
+        return False
+    pid = _read_pid_file(pid_file)
+    if not _pid_alive(pid):
+        try:
+            os.remove(pid_file)
+        except OSError:
+            pass
+        return False
+    import signal
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
 if __name__ == "__main__":
     import json as _json
-    if len(sys.argv) >= 3 and sys.argv[1] == "--update-cache":
-        cache_path = sys.argv[2]
+
+    args = sys.argv[1:]
+    if args and args[0] == "--update-cache" and len(args) >= 2:
+        cache_path = args[1]
+        timeout = float(args[2]) if len(args) >= 3 else 20.0
         set_cache_path(cache_path)
-        result = probe()
+        result = probe(timeout=timeout)
         write_cache(result)
+    elif args and args[0] == "--daemon" and len(args) >= 2:
+        cache_path = args[1]
+        interval = float(args[2]) if len(args) >= 3 else DEFAULT_DAEMON_INTERVAL
+        daemon_loop(cache_path, interval)
+    elif args and args[0] == "--ensure-daemon" and len(args) >= 3:
+        cache_path = args[1]
+        src_dir = args[2]
+        interval = float(args[3]) if len(args) >= 4 else DEFAULT_DAEMON_INTERVAL
+        ensure_daemon(cache_path, src_dir, interval)
+    elif args and args[0] == "--stop-daemon" and len(args) >= 2:
+        stop_daemon(args[1])
     else:
         result = probe()
         print(result)
