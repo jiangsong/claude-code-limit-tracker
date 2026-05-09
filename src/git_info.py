@@ -4,12 +4,14 @@ Git information module for Claude Code status line integration.
 Provides git branch, status, and sync information with caching for performance.
 """
 
+import hashlib
+import json
 import subprocess
 import time
 import os
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
-from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
 
 
 @dataclass
@@ -26,47 +28,105 @@ class GitStatus:
 
 
 class GitInfo:
-    """Git information provider with caching for performance."""
-    
-    def __init__(self, cache_duration: int = 5):
+    """Git information provider with caching for performance.
+
+    Each `get_git_status` call would otherwise spawn ~4 git subprocesses (~500ms
+    on a real repo), which dominates the status-line render time. Each
+    status-line invocation runs in a fresh Python process, so an in-memory
+    cache alone cannot help — results are also persisted to a per-directory
+    JSON file under `data/`, scoped by a directory hash, with a short TTL.
+    """
+
+    DISK_CACHE_DIRNAME = "git_cache"
+    DEFAULT_CACHE_DURATION = 60  # seconds — covers both in-process and disk
+
+    def __init__(self, cache_duration: int = DEFAULT_CACHE_DURATION):
         """Initialize GitInfo with cache duration in seconds."""
         self.cache_duration = cache_duration
         self._cache: Dict[str, Any] = {}
         self._cache_time: Dict[str, float] = {}
-    
+        # data/ lives next to src/ — keep co-located with the other caches.
+        self._disk_cache_dir = (
+            Path(__file__).parent.parent / "data" / self.DISK_CACHE_DIRNAME
+        )
+
     def get_git_status(self, directory: Optional[str] = None) -> GitStatus:
         """
         Get comprehensive git status for the given directory.
-        
+
         Args:
             directory: Directory to check (defaults to current directory)
-            
+
         Returns:
             GitStatus object with all git information
         """
         directory = directory or os.getcwd()
         cache_key = f"git_status:{directory}"
-        
-        # Check cache
+
         if self._is_cache_valid(cache_key):
             return self._cache[cache_key]
-        
-        # Get fresh git status
+
+        disk_cached = self._read_disk_cache(directory)
+        if disk_cached is not None:
+            self._cache[cache_key] = disk_cached
+            self._cache_time[cache_key] = time.time()
+            return disk_cached
+
         status = self._fetch_git_status(directory)
-        
-        # Cache result
+
         self._cache[cache_key] = status
         self._cache_time[cache_key] = time.time()
-        
+        self._write_disk_cache(directory, status)
+
         return status
-    
+
     def _is_cache_valid(self, cache_key: str) -> bool:
         """Check if cached data is still valid."""
         if cache_key not in self._cache:
             return False
-        
+
         cache_age = time.time() - self._cache_time.get(cache_key, 0)
         return cache_age < self.cache_duration
+
+    # --- Cross-process disk cache --------------------------------------------
+
+    def _disk_cache_path(self, directory: str) -> Path:
+        # Hash so paths with separators / weird chars become safe filenames.
+        digest = hashlib.sha1(directory.encode("utf-8")).hexdigest()[:16]
+        return self._disk_cache_dir / f"{digest}.json"
+
+    def _read_disk_cache(self, directory: str) -> Optional[GitStatus]:
+        path = self._disk_cache_path(directory)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return None
+        if (time.time() - mtime) > self.cache_duration:
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        try:
+            return GitStatus(**data)
+        except TypeError:
+            return None
+
+    def _write_disk_cache(self, directory: str, status: GitStatus) -> None:
+        path = self._disk_cache_path(directory)
+        tmp = path.with_suffix(".tmp")
+        try:
+            self._disk_cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(asdict(status), f)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
     
     def _fetch_git_status(self, directory: str) -> GitStatus:
         """Fetch fresh git status information."""

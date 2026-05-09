@@ -4,9 +4,7 @@ version = "2.0.0"
 description = "Fast, accurate usage tracking for Claude Code with real session time calculation"
 readme = "README.md"
 requires-python = ">=3.8"
-dependencies = [
-    "numpy>=1.20.0",
-]
+dependencies = []
 
 [build-system]
 requires = ["setuptools>=61.0"]

@@ -71,9 +71,11 @@ class Config:
         # Load or create user config
         self.tier = self._load_user_tier()
         
-        # Load git settings with defaults
+        # Load git settings with defaults. Cache for 60s by default — git
+        # subprocess calls dominate status-line latency, and server data
+        # (stdin / probe) is the authoritative source for usage percentages.
         self.show_git_info = True
-        self.git_cache_duration = 5
+        self.git_cache_duration = 60
         self._load_git_settings()
         
         # Save limits for reference

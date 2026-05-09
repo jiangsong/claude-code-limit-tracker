@@ -77,50 +77,11 @@ def setup_virtual_env():
             print(f"❌ Failed to create virtual environment: {err}")
             return False
 
-    # If numpy already imports cleanly, skip the install step entirely. This
-    # matters because `uv venv` creates a pip-less venv, so the stdlib pip
-    # fallback fails on existing uv-created venvs.
-    probe = subprocess.run(
-        [str(py), "-c", "import numpy"], capture_output=True
-    )
-    if probe.returncode == 0:
-        print("✓ numpy already installed")
-        print("✓ Python environment configured")
-        return True
-
-    print("Installing numpy...")
-    if _have_uv():
-        cmd = ["uv", "pip", "install", "numpy", "--python", str(py)]
-        cwd = project_dir
-    else:
-        # Bootstrap pip if the venv was created without it (e.g. `uv venv`).
-        has_pip = subprocess.run(
-            [str(py), "-c", "import pip"], capture_output=True
-        ).returncode == 0
-        if not has_pip:
-            print("Bootstrapping pip via ensurepip...")
-            ensure = subprocess.run(
-                [str(py), "-m", "ensurepip", "--upgrade"], capture_output=True
-            )
-            if ensure.returncode != 0:
-                err = ensure.stderr.decode(errors="replace") if ensure.stderr else ""
-                print(f"❌ ensurepip failed: {err}")
-                print("  Install uv (https://github.com/astral-sh/uv) or recreate "
-                      ".venv with `python -m venv .venv` and retry.")
-                return False
-        cmd = [str(py), "-m", "pip", "install", "--disable-pip-version-check", "numpy"]
-        cwd = None
-    result = subprocess.run(cmd, cwd=cwd, capture_output=True)
-    if result.returncode != 0:
-        err = result.stderr.decode(errors="replace") if result.stderr else ""
-        print(f"❌ Failed to install numpy: {err}")
-        return False
-
-    print("✓ Python environment configured")
+    # The tracker is now stdlib-only; no third-party deps need installing.
+    # We keep a dedicated venv anyway so the status-line interpreter is
+    # isolated from whatever lives on the user's PATH.
+    print("✓ Python environment configured (no third-party dependencies)")
     return True
-
-
-SESSION_HOOK_TIMEOUT = "15"  # seconds; SessionStart blocks Claude startup
 
 
 def _data_dir(project_dir: Path) -> Path:
@@ -135,40 +96,37 @@ def _probe_script(project_dir: Path) -> Path:
     return project_dir / "src" / "claude_probe.py"
 
 
-def _install_session_start_hook(settings: dict, project_dir: Path) -> None:
-    """Register a SessionStart hook that synchronously refreshes the probe cache.
+def _purge_session_start_hook(settings: dict, project_dir: Path) -> None:
+    """Remove any previously-installed probe hook from SessionStart.
 
-    This guarantees that the very first status-line render after Claude Code
-    starts up shows real-time `/usage` data instead of whatever was cached
-    when the previous session ended.
-
-    The hook is idempotent across re-installs: any existing hook entry whose
-    command points at our claude_probe.py is replaced rather than duplicated.
+    Earlier versions of `install.py` registered a SessionStart hook that
+    synchronously ran `claude /usage` whenever Claude Code started. That call
+    is genuinely expensive (it spins up an entire Claude Code subprocess) and
+    its result doesn't even paint on the UI until the *next* status-line
+    render — so the user sees a multi-second startup hit for no visible gain.
+    The probe daemon already keeps the cache fresh on its own schedule, so we
+    just sweep the old hook out and leave nothing in its place.
     """
-    py = _venv_python(project_dir)
-    cache_path = _probe_cache_path(project_dir)
-    probe = _probe_script(project_dir)
-    hook_command = f'"{py}" "{probe}" --update-cache "{cache_path}" {SESSION_HOOK_TIMEOUT}'
+    hooks = settings.get("hooks") or {}
+    session_hooks = hooks.get("SessionStart")
+    if not session_hooks:
+        return
 
-    hooks = settings.setdefault("hooks", {})
-    session_hooks = hooks.setdefault("SessionStart", [])
-
-    probe_str = str(probe)
-    new_entries = []
+    probe_str = str(_probe_script(project_dir))
+    cleaned = []
     for entry in session_hooks:
         sub_hooks = (entry or {}).get("hooks") or []
-        # Drop any prior installation of *our* probe hook; keep all others.
         keep = [h for h in sub_hooks if probe_str not in (h or {}).get("command", "")]
         if keep:
             new_entry = dict(entry)
             new_entry["hooks"] = keep
-            new_entries.append(new_entry)
+            cleaned.append(new_entry)
 
-    new_entries.append({
-        "matcher": "",
-        "hooks": [{"type": "command", "command": hook_command}],
-    })
-    hooks["SessionStart"] = new_entries
+    if cleaned:
+        hooks["SessionStart"] = cleaned
+    else:
+        hooks.pop("SessionStart", None)
+    settings["hooks"] = hooks
 
 
 def integrate_with_claude():
@@ -199,22 +157,24 @@ def integrate_with_claude():
         'command': f'"{py}" "{status_script}"',
     }
 
-    _install_session_start_hook(settings, project_dir)
+    _purge_session_start_hook(settings, project_dir)
 
     claude_settings.parent.mkdir(exist_ok=True)
     with open(claude_settings, 'w', encoding='utf-8') as f:
         json.dump(settings, f, indent=2)
 
-    print("✓ Claude Code settings updated (statusLine + SessionStart probe hook)")
+    print("✓ Claude Code settings updated (statusLine; SessionStart probe hook removed)")
     return True
 
 
 def start_probe_daemon():
     """Spawn the background probe daemon if not already running.
 
-    The daemon polls `claude /usage` every 10 minutes, so cached quota data
-    stays current even when no Claude Code session is active. On macOS/Linux
-    only — PTY probe is not supported on Windows.
+    The daemon polls `claude /usage` every 1 hour. The same call used to fire
+    on every Claude Code session start as well, but it's expensive (spawns a
+    full Claude Code subprocess) and the cached result doesn't surface in the
+    UI until the next status-line render anyway, so we lean on the daemon
+    alone. On macOS/Linux only — PTY probe is not supported on Windows.
     """
     if sys.platform == "win32":
         print("ℹ Skipping probe daemon (PTY probe not supported on Windows)")
@@ -234,7 +194,7 @@ def start_probe_daemon():
         capture_output=True,
     )
     if result.returncode == 0:
-        print("✓ Probe daemon ensured (refreshes /usage every 10 min)")
+        print("✓ Probe daemon ensured (refreshes /usage every 1 hour)")
         return True
     err = result.stderr.decode(errors="replace") if result.stderr else ""
     print(f"⚠️  Failed to start probe daemon: {err}")

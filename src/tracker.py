@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
 Main tracker module for Claude Code usage tracking.
-Optimized with numpy for fast processing of conversation data.
+
+Stdlib-only implementation: ships with the venv that `install.py` creates and
+needs no third-party packages, which keeps per-status-line interpreter startup
+under 1s even on cold caches.
 """
 
 import json
 import os
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
-import numpy as np
-from dataclasses import dataclass, asdict
 import time
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 @dataclass
 class SessionData:
@@ -183,9 +185,8 @@ class UsageTracker:
         end_time = 0.0
         
         if timestamps:
-            timestamps = np.array(timestamps)
-            start_time = float(timestamps.min())
-            end_time = float(timestamps.max())
+            start_time = min(timestamps)
+            end_time = max(timestamps)
             duration_hours = (end_time - start_time) / 3600
         
         session = SessionData(
@@ -240,7 +241,6 @@ class UsageTracker:
         cycle_start, cycle_prompts = self._compute_rolling_5h_window(all_prompt_ts)
         self.cycle_5h_start = cycle_start
 
-        # Calculate weekly stats using numpy for efficiency
         weekly_prompts = sum(s.prompt_count for s in week_sessions)
         
         # Calculate model-specific hours
@@ -282,12 +282,160 @@ class UsageTracker:
             },
             "last_updated": int(usage_data.last_updated * 1000)
         }
-        
+
         with open(self.data_path / "usage_data.json", 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
-    
+
+    # --- Cross-process disk cache --------------------------------------------
+    # `update()` is invoked on every Claude Code status-line refresh (sub-second
+    # cadence). A full scan parses every JSONL under ~/.claude/projects/, which
+    # is hundreds of files for a real user — concurrent status-line processes
+    # pile up faster than they can finish. Memoizing the computed result on disk
+    # for a short TTL collapses repeated refreshes into a single small read.
+    UPDATE_CACHE_FILE = "tracker_cache.json"
+    UPDATE_LOCK_FILE = "tracker_cache.lock"
+    # Server-side rate_limits (stdin) / `claude /usage` probe are the
+    # authoritative source for percentages and reset times. The tracker only
+    # contributes the local prompt count + fallback estimates, so a coarse 60s
+    # TTL is fine and slashes the per-render scan cost.
+    UPDATE_CACHE_TTL = 60.0  # seconds — fresh-cache window
+    UPDATE_LOCK_TTL = 120.0  # seconds — auto-recover from a crashed refresher
+
+    def _update_cache_path(self) -> Path:
+        return self.data_path / self.UPDATE_CACHE_FILE
+
+    def _update_lock_path(self) -> Path:
+        return self.data_path / self.UPDATE_LOCK_FILE
+
+    def _read_disk_cached_usage(self, allow_stale: bool = False
+                                ) -> Tuple[Optional[UsageData], float]:
+        """Return (cached, age_seconds). cached is None if file missing/corrupt.
+
+        When allow_stale=False, a cache older than UPDATE_CACHE_TTL is treated
+        as missing (returns (None, age)) so callers can decide whether to
+        recompute or fall back to the stale copy themselves.
+        """
+        cache_file = self._update_cache_path()
+        try:
+            mtime = cache_file.stat().st_mtime
+        except OSError:
+            return None, float("inf")
+        age = time.time() - mtime
+        if not allow_stale and age > self.UPDATE_CACHE_TTL:
+            return None, age
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return None, age
+        try:
+            usage = UsageData(
+                current_5h_prompts=d['current_5h_prompts'],
+                current_5h_start=d['current_5h_start'],
+                weekly_sonnet_hours=d['weekly_sonnet_hours'],
+                weekly_opus_hours=d['weekly_opus_hours'],
+                weekly_prompts=d['weekly_prompts'],
+                weekly_start=d['weekly_start'],
+                last_updated=d['last_updated'],
+                sessions=[],  # Sessions list is only used as a last-resort
+                              # fallback for model detection; status line now
+                              # gets the model from stdin, so dropping it keeps
+                              # the cache file tiny.
+            )
+        except KeyError:
+            return None, age
+        return usage, age
+
+    def _write_disk_cached_usage(self, usage_data: UsageData) -> None:
+        cache_file = self._update_cache_path()
+        payload = {
+            'current_5h_prompts': usage_data.current_5h_prompts,
+            'current_5h_start': usage_data.current_5h_start,
+            'weekly_sonnet_hours': usage_data.weekly_sonnet_hours,
+            'weekly_opus_hours': usage_data.weekly_opus_hours,
+            'weekly_prompts': usage_data.weekly_prompts,
+            'weekly_start': usage_data.weekly_start,
+            'last_updated': usage_data.last_updated,
+        }
+        tmp = cache_file.with_suffix('.tmp')
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(payload, f)
+            os.replace(tmp, cache_file)
+        except OSError:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+    def _try_acquire_refresh_lock(self) -> bool:
+        """Atomic single-flight lock for cache refresh.
+
+        Uses O_CREAT|O_EXCL on a sentinel file so it works across macOS, Linux
+        and Windows without fcntl. A stale lock (older than UPDATE_LOCK_TTL —
+        e.g. the previous holder crashed mid-scan) is reaped before retrying.
+        """
+        lock_path = self._update_lock_path()
+        try:
+            mtime = lock_path.stat().st_mtime
+            if (time.time() - mtime) > self.UPDATE_LOCK_TTL:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False
+        except OSError:
+            return False
+        try:
+            os.write(fd, str(os.getpid()).encode())
+        finally:
+            os.close(fd)
+        return True
+
+    def _release_refresh_lock(self) -> None:
+        try:
+            self._update_lock_path().unlink()
+        except OSError:
+            pass
+
     def update(self) -> UsageData:
-        """Update and return current usage data."""
+        """Update and return current usage data.
+
+        Refresh policy:
+          * Fresh cache (<= TTL)            → return as-is.
+          * Stale cache + lock acquired     → recompute, write, return fresh.
+          * Stale cache + lock held by peer → return the stale copy (the peer
+            will refresh it shortly; this prevents a thundering-herd of
+            concurrent full scans when the TTL expires under refresh storm).
+          * No cache + lock acquired        → recompute (first-ever run).
+          * No cache + lock held by peer    → fall back to a fresh scan
+            ourselves; we have nothing to serve. Rare.
+        """
+        fresh, _ = self._read_disk_cached_usage(allow_stale=False)
+        if fresh is not None:
+            return fresh
+
+        if not self._try_acquire_refresh_lock():
+            stale, _ = self._read_disk_cached_usage(allow_stale=True)
+            if stale is not None:
+                return stale
+            # No cache to fall back on → scan inline (rare cold path).
+            return self._compute_and_persist()
+
+        try:
+            return self._compute_and_persist()
+        finally:
+            self._release_refresh_lock()
+
+    def _compute_and_persist(self) -> UsageData:
         usage_data = self.calculate_usage()
         self.save_usage_data(usage_data)
+        self._write_disk_cached_usage(usage_data)
         return usage_data

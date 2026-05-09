@@ -43,7 +43,11 @@ from config import Config
 from git_info import GitInfo
 import claude_probe as probe_mod
 
-PROBE_TTL = 600  # seconds before triggering a background refresh (10 minutes)
+PROBE_TTL = 3600  # seconds — daemon refreshes /usage at most once per hour.
+                  # `claude /usage` is genuinely expensive (spins up a full
+                  # Claude Code subprocess) and the same value also appears
+                  # nowhere on screen until the next render, so polling it
+                  # often costs CPU without a visible benefit.
 
 
 def _probe_cache_path() -> str:
@@ -66,26 +70,112 @@ def _pct_color(config: "Config", pct_used: int):
         return (255, 80, 80)    # red
 
 
-def _format_reset(reset_text: Optional[str], time_remaining_sec: float) -> str:
-    """Return a formatted reset string, preferring the probe's reset time."""
-    if reset_text:
-        # Extract just the time part, e.g. "11:50am" from "Resets 11:50am (Asia/Shanghai)"
-        import re
-        m = re.search(r"(\d{1,2}:\d{2}[ap]m)", reset_text, re.IGNORECASE)
-        if m:
-            return m.group(1)
-        # Monthly reset e.g. "May 4, 2pm"
-        m = re.search(r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+,\s*\d+(?::\d+)?[ap]m)",
-                      reset_text, re.IGNORECASE)
-        if m:
-            return m.group(1)
-        return reset_text
-    # Fall back to countdown
-    if time_remaining_sec <= 0:
-        return "now"
-    h = int(time_remaining_sec // 3600)
-    m = int((time_remaining_sec % 3600) // 60)
-    return f"{h}h{m:02d}m" if h else f"{m}m"
+_MONTH_INDEX = {
+    name: idx + 1 for idx, name in enumerate(
+        ["jan", "feb", "mar", "apr", "may", "jun",
+         "jul", "aug", "sep", "oct", "nov", "dec"]
+    )
+}
+
+
+def _parse_reset_text_to_epoch(reset_text: str,
+                               max_horizon_secs: float) -> Optional[float]:
+    """Parse a probe-cache reset string into an epoch timestamp.
+
+    Two forms are produced by `claude /usage`:
+      * "Resets 11:50am (Asia/Shanghai)" — clock time only, used for the
+        5-hour cycle (always within ~5h, so rolls to tomorrow if the time
+        has already passed today).
+      * "Resets May 4, 2pm (Asia/Shanghai)" — date + time, used for the
+        weekly window (rolls year forward if the date is already past).
+
+    The CLI emits these in the user's local time zone, so a naive
+    `datetime.now()` parse matches the wall-clock the user reads on screen
+    without needing tzdata or zoneinfo. Returns None on any failure.
+
+    `max_horizon_secs` is a sanity bound on the time-only form; if the
+    inferred target is further out than the bound (with 20% slack) we
+    treat the parse as ambiguous rather than guess.
+    """
+    if not reset_text:
+        return None
+    import re
+    from datetime import datetime, timedelta
+
+    body = re.sub(r"^Resets?\s+", "", reset_text, flags=re.IGNORECASE).strip()
+    body = re.sub(r"\s*\([^)]*\)\s*$", "", body).strip()
+    now = datetime.now()
+
+    # Day-and-time separator varies between Claude Code versions:
+    #   "May 4, 2pm"       — comma
+    #   "May 15 at 7pm"    — the word "at"
+    #   "May 15 7pm"       — bare whitespace
+    m = re.match(
+        r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec))[a-z]*"
+        r"\s+(\d{1,2})"
+        r"(?:\s*,\s*|\s+at\s+|\s+)"
+        r"(\d{1,2})(?::(\d{1,2}))?\s*([ap]m)",
+        body, re.IGNORECASE,
+    )
+    if m:
+        month = _MONTH_INDEX.get(m.group(1).lower()[:3])
+        if month is None:
+            return None
+        day = int(m.group(2))
+        hour = int(m.group(3))
+        minute = int(m.group(4) or 0)
+        ampm = m.group(5).lower()
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+        try:
+            target = now.replace(month=month, day=day, hour=hour, minute=minute,
+                                 second=0, microsecond=0)
+        except ValueError:
+            return None
+        if target < now:
+            try:
+                target = target.replace(year=now.year + 1)
+            except ValueError:
+                return None
+        return target.timestamp()
+
+    m = re.match(r"(\d{1,2}):(\d{2})\s*([ap]m)", body, re.IGNORECASE)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2))
+        ampm = m.group(3).lower()
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        if (target - now).total_seconds() > max_horizon_secs * 1.2:
+            return None
+        return target.timestamp()
+
+    return None
+
+
+def _resolve_reset_secs(stdin_resets_at: Optional[float],
+                        probe_reset_text: Optional[str],
+                        max_horizon_secs: float) -> Optional[float]:
+    """Return seconds-until-reset using the most authoritative source.
+
+    Priority: stdin epoch (already a number) → probe text parsed to epoch.
+    Returns None when neither source yields a usable value, so the caller
+    can decide whether to fall back to a local estimate or hide the field.
+    """
+    if stdin_resets_at:
+        return stdin_resets_at - time.time()
+    if probe_reset_text:
+        epoch = _parse_reset_text_to_epoch(probe_reset_text, max_horizon_secs)
+        if epoch is not None:
+            return epoch - time.time()
+    return None
 
 
 def _format_countdown(secs: float) -> str:
@@ -232,11 +322,12 @@ def generate_status_line():
     cached, cached_at = probe_mod.read_cache()
 
     now = time.time()
-    if cached_at is None or now - cached_at > PROBE_TTL * 2:
-        # Daemon is running but the cache is unusually stale (e.g. probe is
-        # currently failing). Fire a one-shot probe as a safety net so we still
-        # get refresh attempts at status-line cadence.
-        probe_mod.spawn_background_refresh(cache_path, _src_dir())
+    # The daemon polls `claude /usage` every PROBE_TTL seconds and is the sole
+    # cache writer. Earlier versions also fired a one-shot `spawn_background_refresh`
+    # whenever the cache looked stale, but that piled up multiple `claude /usage`
+    # processes per status-line refresh (each one quite CPU-heavy) without
+    # actually helping when the underlying probe was failing — the daemon's own
+    # next tick covers the same case.
 
     # --- Fallback reset time from rolling window ---
     cycle_end = usage.current_5h_start + 5 * 3600
@@ -272,16 +363,18 @@ def generate_status_line():
             f"⚡{prompt_count}p·{pct}%"
             f"\033[0m"
         )
-        # Reset time from stdin resets_at, fall back to probe text or countdown
-        resets_at = stdin_5h.get("resets_at")
-        if resets_at:
-            secs_left = resets_at - now
-            reset_str = _format_reset(None, secs_left)
-        else:
-            reset_str = _format_reset(
-                cached.session_reset_text if cached else None, time_remaining
-            )
-        parts.append(f"🔄 {reset_str}")
+        # Reset countdown — prefer stdin's epoch, then parse probe text,
+        # finally fall back to the local rolling-window estimate. Always
+        # rendered as a countdown so the format stays the same whether
+        # we're at session startup (probe cache) or steady-state (stdin).
+        secs = _resolve_reset_secs(
+            stdin_5h.get("resets_at"),
+            cached.session_reset_text if cached else None,
+            5 * 3600,
+        )
+        if secs is None:
+            secs = time_remaining
+        parts.append(f"🔄 {_format_countdown(secs)}")
     elif cached and cached.session_pct_used is not None:
         pct = cached.session_pct_used
         color = _pct_color(config, pct)
@@ -291,8 +384,10 @@ def generate_status_line():
             f"⚡{prompt_count}p·{pct}%"
             f"\033[0m"
         )
-        reset_str = _format_reset(cached.session_reset_text, time_remaining)
-        parts.append(f"🔄 {reset_str}")
+        secs = _resolve_reset_secs(None, cached.session_reset_text, 5 * 3600)
+        if secs is None:
+            secs = time_remaining
+        parts.append(f"🔄 {_format_countdown(secs)}")
     else:
         # Fallback: local rolling-window estimate
         limits = config.get_tier_limits()
@@ -303,7 +398,7 @@ def generate_status_line():
             f"⚡{usage.current_5h_prompts}/{limits.cycle_5h_max}p({pct_est}%~)"
             f"\033[0m"
         )
-        parts.append(f"🔄 {_format_reset(None, time_remaining)}")
+        parts.append(f"🔄 {_format_countdown(time_remaining)}")
 
     # --- Weekly usage ---
     # Priority: stdin rate_limits (overall%) + probe cache (sonnet/opus split) → local estimate
@@ -334,12 +429,17 @@ def generate_status_line():
                 f"O:{cached.opus_pct_used}%"
                 f"\033[0m"
             )
-        # Weekly reset: only show a compact countdown when stdin gives a numeric
-        # resets_at. The probe-cache text fallback ("Resets May 1 at 7pm …") is
-        # intentionally dropped to keep the status line short.
-        w_resets_at = stdin_7d.get("resets_at") if stdin_7d else None
-        if w_resets_at:
-            weekly_str += f" ↻{_format_countdown(w_resets_at - now)}"
+        # Weekly reset countdown — stdin's numeric resets_at is preferred; if
+        # missing (e.g. early in a session before any API call has populated
+        # rate_limits), derive from the probe cache's "Resets May 4, 2pm" form
+        # so the indicator stays consistent across data sources.
+        weekly_secs = _resolve_reset_secs(
+            stdin_7d.get("resets_at") if stdin_7d else None,
+            cached.weekly_reset_text if cached else None,
+            7 * 86400,
+        )
+        if weekly_secs is not None:
+            weekly_str += f" ↻{_format_countdown(weekly_secs)}"
         parts.append(weekly_str)
     else:
         # Fallback: local session-hour estimate (labelled as approximate)

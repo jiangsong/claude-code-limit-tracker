@@ -26,7 +26,7 @@ from typing import Optional, Tuple
 # will fall back to an error ProbeResult there.
 _PTY_AVAILABLE = sys.platform != "win32"
 
-DEFAULT_DAEMON_INTERVAL = 600.0  # seconds — matches PROBE_TTL in status_line.py
+DEFAULT_DAEMON_INTERVAL = 3600.0  # seconds — matches PROBE_TTL in status_line.py
 PID_FILE_NAME = "probe_daemon.pid"
 
 
